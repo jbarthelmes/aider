@@ -51,6 +51,11 @@ from aider.waiting import WaitingSpinner
 
 from ..dump import dump  # noqa: F401
 from .chat_chunks import ChatChunks
+import dspy
+import os # For os.getenv
+from dspy.models.openai import OpenAI as DSPyOpenAI
+from aider import dspy_modules
+from aider.coders.ask_coder import AskCoder # Import AskCoder
 
 
 class UnknownEditFormat(ValueError):
@@ -191,6 +196,21 @@ class Coder:
             if hasattr(coder, "edit_format") and coder.edit_format == edit_format:
                 res = coder(main_model, io, **kwargs)
                 res.original_kwargs = dict(kwargs)
+                # Assign DSPy predictor after successful instantiation of 'res'
+                if isinstance(res, AskCoder): # Specific check for AskCoder
+                    res.dspy_predictor = dspy_modules.DspyAskPredictor()
+                elif hasattr(res, 'edit_format') and res.edit_format:
+                    # General mapping for other coders based on their edit_format
+                    if res.edit_format == "diff":
+                        res.dspy_predictor = dspy_modules.DspyEditBlockPredictor()
+                    elif res.edit_format == "whole":
+                        res.dspy_predictor = dspy_modules.DspyWholeFilePredictor()
+                    elif res.edit_format == "udiff":
+                        res.dspy_predictor = dspy_modules.DspyUdiffPredictor()
+                    else:
+                        res.dspy_predictor = None # No specific DSPy module for this edit_format
+                else:
+                    res.dspy_predictor = None # Default if no edit_format or not AskCoder
                 return res
 
         valid_formats = [
@@ -1430,7 +1450,144 @@ class Coder:
         messages = chunks.all_messages()
         if not self.check_tokens(messages):
             return
-        self.warm_cache(chunks)
+
+        # <<< BEGIN DSPy Integration Block >>>
+        if hasattr(self, 'dspy_predictor') and self.dspy_predictor:
+            # 1. Prepare Inputs for DSPy Predictor
+            # system_prompt_main_str
+            raw_system_prompt = self.gpt_prompts.main_system
+            system_prompt_main_str = self.fmt_system_prompt(raw_system_prompt)
+            if self.main_model.examples_as_sys_msg and self.gpt_prompts.example_messages:
+                example_str_parts = ["\n\n# Example conversations:\n"]
+                for msg in self.gpt_prompts.example_messages:
+                    formatted_content = self.fmt_system_prompt(msg['content'])
+                    example_str_parts.append(f"\n## {msg['role'].upper()}:\n{formatted_content}\n")
+                system_prompt_main_str += "".join(example_str_parts)
+
+            # repo_context_str
+            repo_messages_list = self.get_repo_messages()
+            readonly_files_messages_list = self.get_readonly_files_messages()
+            chat_files_messages_list = self.get_chat_files_messages()
+
+            context_messages_str_parts = []
+            for msg_list in [repo_messages_list, readonly_files_messages_list, chat_files_messages_list]:
+                for msg in msg_list:
+                    content_to_add = ""
+                    if isinstance(msg.get('content'), list):
+                        # Handle vision message format by extracting text parts
+                        text_parts = [item['text'] for item in msg['content'] if item.get('type') == 'text']
+                        content_to_add = " ".join(text_parts)
+                    elif isinstance(msg.get('content'), str):
+                        content_to_add = msg['content']
+
+                    if content_to_add: # Add only if there's actual text content
+                        context_messages_str_parts.append(f"\n{msg['role'].upper()}:\n{content_to_add}\n")
+            repo_context_str = "".join(context_messages_str_parts)
+
+
+            # chat_history_str
+            self.summarize_end()
+            chat_history_str_parts = []
+            for msg in self.done_messages:
+                # Ensure content is string, skip if None or not string (e.g. function calls if they were in done_messages)
+                if isinstance(msg.get('content'), str):
+                    chat_history_str_parts.append(f"\n{msg['role'].upper()}:\n{msg['content']}\n")
+            chat_history_str = "".join(chat_history_str_parts)
+
+            # user_request_str
+            user_request_str = inp
+
+            # system_reminder_final_str
+            system_reminder_final_str = ""
+            if hasattr(self.gpt_prompts, 'system_reminder') and self.gpt_prompts.system_reminder:
+                raw_reminder = self.gpt_prompts.system_reminder
+                # Ensure raw_reminder is not None before formatting
+                if raw_reminder:
+                    formatted_reminder = self.fmt_system_prompt(raw_reminder)
+                    if self.main_model.reminder == 'sys':
+                        system_reminder_final_str = formatted_reminder
+
+            # 2. Configure DSPy LM
+            if not dspy.settings.lm and self.main_model:
+                active_model_name = self.main_model.name
+                if active_model_name.startswith("openai/"):
+                    active_model_name = active_model_name.split("/", 1)[1]
+
+                api_key = getattr(self.main_model, 'api_key', os.getenv("OPENAI_API_KEY"))
+                base_url = getattr(self.main_model, 'api_base', None)
+                max_output_tokens = getattr(self.main_model.info, 'max_output_tokens', 2048)
+                http_client = getattr(self.main_model, 'http_client', None)
+
+                configured_lm = DSPyOpenAI(
+                    model=active_model_name,
+                    api_key=api_key,
+                    api_base=base_url,
+                    max_tokens=max_output_tokens,
+                    http_client=http_client,
+                    temperature=self.temperature if self.temperature is not None else 0.0,
+                )
+                dspy.settings.configure(lm=configured_lm)
+
+            if not dspy.settings.lm:
+                self.io.tool_error("DSPy LM not configured, falling back to LiteLLM.")
+                self.dspy_predictor = None # Disable for this call to force fallback
+            else:
+                self.io.tool_output("Using DSPy predictor...")
+                self.partial_response_function_call = {} # Ensure it's reset for DSPy path
+                try:
+                    with WaitingSpinner(f"Waiting for DSPy model ({self.main_model.name})..."):
+                        prediction = self.dspy_predictor(
+                            system_prompt_main=system_prompt_main_str,
+                            repo_context=repo_context_str,
+                            chat_history=chat_history_str,
+                            user_request=user_request_str,
+                            system_reminder_final=system_reminder_final_str
+                        )
+                    self.partial_response_content = prediction.assistant_response
+
+                    self.mdstream = None
+
+                    # Simplified token/cost for DSPy path
+                    prompt_tokens = self.main_model.token_count(
+                        system_prompt_main_str + repo_context_str + chat_history_str + user_request_str + system_reminder_final_str
+                    )
+                    completion_tokens = self.main_model.token_count(self.partial_response_content or "")
+
+                    self.message_tokens_sent += prompt_tokens
+                    self.message_tokens_received += completion_tokens
+
+                    cost = self.compute_costs_from_tokens(prompt_tokens, completion_tokens, 0, 0)
+                    self.message_cost += cost
+
+                    # This will be displayed by show_usage_report later
+                    self.usage_report = (
+                        f"Tokens: {format_tokens(prompt_tokens)} sent, {format_tokens(completion_tokens)} received (DSPy). "
+                        f"Cost: ${self.message_cost:.3f} message, ${self.total_cost + self.message_cost:.3f} session (DSPy)."
+                    )
+
+                    # Bypassing original streaming and litellm call by letting the function proceed to `finally`
+                    # The original `finally` block and subsequent processing will use `self.partial_response_content`
+                    # Set by this DSPy path.
+
+                except Exception as e:
+                    self.io.tool_error(f"DSPy predictor failed: {e}")
+                    traceback.print_exc()
+                    self.io.tool_warning("Falling back to original LiteLLM call due to DSPy error.")
+                    self.dspy_predictor = None # Disable for this call to force fallback
+
+                if self.dspy_predictor: # If DSPy path was taken and didn't fallback to None
+                    # This means DSPy path was successful (or an error occurred that didn't set dspy_predictor to None)
+                    # The original `send_message` structure has a `finally` block, then more processing.
+                    # The `self.partial_response_content` is now set.
+                    # We will let the code flow into the original `finally` block and the subsequent code.
+                    # The key is that `yield from self.send(...)` is *not* called if dspy_predictor was used.
+                    pass # Proceed to finally block and beyond.
+
+        # <<< END DSPy Integration Block >>>
+
+        # Original LiteLLM path continues if self.dspy_predictor is None or DSPy path failed and set it to None
+        if not (hasattr(self, 'dspy_predictor') and self.dspy_predictor):
+            self.warm_cache(chunks) # Original LiteLLM path
 
         if self.verbose:
             utils.show_messages(messages, functions=self.functions)

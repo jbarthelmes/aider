@@ -2,6 +2,8 @@ import contextlib
 import os
 import time
 from pathlib import Path, PurePosixPath
+import dspy
+from aider.dspy_modules import DspyCommit
 
 try:
     import git
@@ -22,6 +24,7 @@ from aider import prompts, utils
 
 from .dump import dump  # noqa: F401
 from .waiting import WaitingSpinner
+from aider.models import Model # For type hinting if needed, and for LM configuration
 
 ANY_GIT_ERROR += [
     OSError,
@@ -77,6 +80,8 @@ class GitRepo:
     ):
         self.io = io
         self.models = models
+        # Placeholder for future, more robust DSPy LM configuration
+        # For now, LM configuration will be attempted in get_commit_message
 
         self.normalized_path = {}
         self.tree_files = {}
@@ -331,46 +336,80 @@ class GitRepo:
         content = ""
         if context:
             content += context + "\n"
-        content += diffs
+        diff_input = "# Diffs:\n" + diffs # Original diffs prefix
+        context_input = context if context else "No additional context provided."
 
-        system_content = self.commit_prompt or prompts.commit_system
-
-        language_instruction = ""
+        language_instruction_input = ""
         if user_language:
-            language_instruction = f"\n- Is written in {user_language}."
-        system_content = system_content.format(language_instruction=language_instruction)
+            # The DspyCommit module expects the language name or a pre-formatted string.
+            # The DspyCommit module's prompt is structured as:
+            # "Ensure the commit message:{{language_instruction_info}}"
+            # So, if user_language is "German", language_instruction_input should be
+            # "\n- Is written in German."
+            # If no language is specified, it should be an empty string.
+            language_instruction_input = f"\n- Is written in {user_language}."
+
+        dspy_committer = DspyCommit()
+
+        # Configure DSPy LM if not done globally. This is a temporary approach.
+        if not dspy.settings.lm and self.models:
+            try:
+                from dspy.models.openai import OpenAI as DSPyOpenAI # Ensure OpenAI is imported if not already
+                active_model = self.models[0] # Use the first model as primary
+                active_model_name = active_model.name
+
+                # Remove "openai/" prefix if present, as dspy.OpenAI expects model names like "gpt-3.5-turbo"
+                if active_model_name.startswith("openai/"):
+                    active_model_name = active_model_name.split("/", 1)[1]
+
+                api_key = getattr(active_model, 'api_key', os.getenv("OPENAI_API_KEY"))
+                base_url = getattr(active_model, 'api_base', None)
+                max_tokens = getattr(active_model, 'max_tokens', 4096) # Default if not specified
+
+                # Pass http_client from the aider model if it exists, for proxy support etc.
+                http_client = getattr(active_model, 'http_client', None)
+
+                configured_lm = DSPyOpenAI(
+                    model=active_model_name,
+                    api_key=api_key,
+                    api_base=base_url,
+                    max_tokens=max_tokens,
+                    http_client=http_client, # Pass http_client here
+                )
+                dspy.settings.configure(lm=configured_lm, temperature=0) # temperature=0 for commit messages
+            except Exception as e:
+                self.io.tool_error(f"DSPy LM configuration failed in get_commit_message: {e}")
+                return "(DSPy LM configuration error)"
+
+        if not dspy.settings.lm:
+            self.io.tool_error("DSPy LM not configured.")
+            return "(DSPy LM not configured)"
 
         commit_message = None
-        for model in self.models:
-            spinner_text = f"Generating commit message with {model.name}"
-            with WaitingSpinner(spinner_text):
-                if model.system_prompt_prefix:
-                    current_system_content = model.system_prompt_prefix + "\n" + system_content
-                else:
-                    current_system_content = system_content
-
-                messages = [
-                    dict(role="system", content=current_system_content),
-                    dict(role="user", content=content),
-                ]
-
-                num_tokens = model.token_count(messages)
-                max_tokens = model.info.get("max_input_tokens") or 0
-
-                if max_tokens and num_tokens > max_tokens:
-                    continue
-
-                commit_message = model.simple_send_with_retries(messages)
-                if commit_message:
-                    break  # Found a model that could generate the message
+        with WaitingSpinner(f"Generating commit message with DSPy ({dspy.settings.lm.kwargs.get('model','default LM')})..."):
+            try:
+                prediction = dspy_committer(
+                    diff_content=diff_input,
+                    context_info=context_input,
+                    language_instruction_info=language_instruction_input
+                )
+                commit_message = prediction.commit_message
+            except Exception as e:
+                self.io.tool_error(f"DSPy commit generation failed: {e}")
+                # Fallback or further error handling can be added here
+                return "(DSPy commit generation error)"
 
         if not commit_message:
-            self.io.tool_error("Failed to generate commit message!")
-            return
+            self.io.tool_error("Failed to generate commit message with DSPy!")
+            return "(DSPy - no message generated)"
 
         commit_message = commit_message.strip()
         if commit_message and commit_message[0] == '"' and commit_message[-1] == '"':
             commit_message = commit_message[1:-1].strip()
+
+        # Ensure final newline is stripped, as some models might add one
+        commit_message = commit_message.splitlines()[0] if commit_message else ""
+
 
         return commit_message
 
