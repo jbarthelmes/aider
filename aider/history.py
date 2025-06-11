@@ -1,6 +1,9 @@
 import argparse
-
+import os
+import dspy
+from dspy.models.openai import OpenAI as DSPyOpenAI
 from aider import models, prompts
+from aider.dspy_modules import DspyChatSummarizer
 from aider.dump import dump  # noqa: F401
 
 
@@ -106,21 +109,59 @@ class ChatSummary:
             if not content.endswith("\n"):
                 content += "\n"
 
-        summarize_messages = [
-            dict(role="system", content=prompts.summarize),
-            dict(role="user", content=content),
-        ]
+        dspy_summarizer = DspyChatSummarizer()
+        configured_lm = None
 
-        for model in self.models:
+        # Configure DSPy LM (using the first available model from self.models)
+        # This logic attempts to configure dspy.settings.lm only if it's not already set globally.
+        # If a global LM is already configured, this summarizer will use it.
+        if not dspy.settings.lm and self.models:
             try:
-                summary = model.simple_send_with_retries(summarize_messages)
-                if summary is not None:
-                    summary = prompts.summary_prefix + summary
-                    return [dict(role="user", content=summary)]
-            except Exception as e:
-                print(f"Summarization failed for model {model.name}: {str(e)}")
+                primary_model = self.models[0]
+                active_model_name = primary_model.name
+                if active_model_name.startswith("openai/"): # Or other prefixes if they exist
+                    active_model_name = active_model_name.split("/", 1)[1]
 
-        raise ValueError("summarizer unexpectedly failed for all models")
+                api_key = getattr(primary_model, 'api_key', os.getenv("OPENAI_API_KEY"))
+                base_url = getattr(primary_model, 'api_base', None)
+                max_output_toks = getattr(primary_model.info, 'max_output_tokens', 1024)
+                http_client = getattr(primary_model, 'http_client', None)
+
+                configured_lm = DSPyOpenAI(
+                    model=active_model_name,
+                    api_key=api_key,
+                    api_base=base_url,
+                    max_tokens=max_output_toks,
+                    temperature=0.0, # Summaries should be deterministic
+                    http_client=http_client
+                )
+                dspy.settings.configure(lm=configured_lm)
+            except Exception as e:
+                print(f"DSPy LM configuration for summarizer failed: {e}")
+                # If config fails, we might still proceed if a global LM was already set.
+                # If not, the next check will catch it.
+
+        if not dspy.settings.lm: # Check if LM is configured (either by above block or globally)
+             raise ValueError("DSPy LM not configured for summarizer and no models available/suitable to configure it.")
+
+        try:
+            prediction = dspy_summarizer(conversation_history=content)
+            summary = prediction.summary
+            if summary is not None: # Ensure summary is not None before prefixing
+                summary = prompts.summary_prefix + summary
+                return [dict(role="user", content=summary)]
+        except Exception as e:
+            # Log the error from DSPy summarization
+            print(f"DSPy summarization failed: {str(e)}")
+            # Fallback to original model loop if desired, or just raise error.
+            # For this refactoring, we'll stick to raising an error if the DSPy path fails,
+            # similar to the original behavior of raising if all models failed.
+            # If self.models has multiple, and want to try them with DSPy, this loop needs to be here.
+            # However, DSPy's typical pattern is one configured LM.
+            # For now, if the primary configured DSPy LM fails, we raise.
+            pass # Will fall through to the ValueError below if summary is None
+
+        raise ValueError("DSPy summarizer unexpectedly failed or returned no summary.")
 
 
 def main():

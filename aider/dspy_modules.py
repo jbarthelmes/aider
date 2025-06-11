@@ -46,6 +46,31 @@ Commit Message:
         return prediction
 
 
+class ChatSummarySignature(dspy.Signature):
+    """Summarize a conversation history."""
+    conversation_history = dspy.InputField(desc="The conversation history formatted with # ROLE headers.")
+    summary = dspy.OutputField(desc="A concise summary of the conversation.")
+
+
+class DspyChatSummarizer(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        # Use the existing summarize prompt from aider.prompts
+        # The existing prompts.summarize is a system message.
+        # DSPy's Predict will take this system message, append the input field (conversation_history),
+        # and then append the output field cue ("Summary:").
+        self.predictor = dspy.Predict(
+            ChatSummarySignature,
+            # The template directly uses the imported string prompts.summarize
+            prompt_template=prompts.summarize + "\n\nConversation History:\n{{conversation_history}}\n\nSummary:"
+        )
+
+    def forward(self, conversation_history):
+        # The conversation_history input to this forward method is the string already formatted
+        # by ChatSummary._format_messages()
+        return self.predictor(conversation_history=conversation_history)
+
+
 class AskSignature(dspy.Signature):
     """Answer questions about the codebase or general programming topics."""
     system_prompt_main = dspy.InputField(desc="The main system prompt for answering questions.")
